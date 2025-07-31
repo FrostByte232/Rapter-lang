@@ -7,6 +7,9 @@ from strings_with_arrows import *
 import string
 import os
 import math
+import tkinter as tk
+from tkinter import messagebox
+import time
 
 #######################################
 # CONSTANTS
@@ -121,6 +124,8 @@ TT_GTE			= 'GTE'
 TT_COMMA		= 'COMMA'
 TT_RETURN		= 'RETURN'
 TT_EOF			= 'EOF'
+TT_NEWLINE		= 'NEWLINE'
+TT_COMMENT		= 'COMMENT'
 
 KEYWORDS = [
 	'var',
@@ -181,6 +186,17 @@ class Lexer:
 		while self.current_char != None:
 			if self.current_char.isspace():  # This handles all whitespace (spaces, tabs, newlines)
 				self.advance()
+			elif self.current_char == '\n':
+				tokens.append(Token(TT_NEWLINE, pos_start=self.pos))
+				self.advance()
+			elif self.current_char == '#':
+				pos_start = self.pos.copy()
+				self.advance()
+
+				while self.current_char != None and self.current_char not in ('\n', '\r'):
+					self.advance()
+
+				tokens.append(Token(TT_COMMENT, pos_start=pos_start, pos_end=self.pos))
 			elif self.current_char in DIGITS:
 				tokens.append(self.make_number())
 			elif self.current_char in LETTERS:
@@ -512,13 +528,28 @@ class Parser:
 		return self.current_tok
 
 	def parse(self):
-		res = self.expr()
-		if not res.error and self.current_tok.type != TT_EOF:
-			return res.failure(InvalidSyntaxError(
-				self.current_tok.pos_start, self.current_tok.pos_end,
-				"Expected '+', '-', '*', '/', '^', '==', '!=', '<', '>', <=', '>=', 'and' or 'or'"
-			))
-		return res
+		res = ParseResult()
+		statements = []
+		pos_start = self.current_tok.pos_start.copy()
+
+		while self.current_tok.type in (TT_NEWLINE, TT_COMMENT):
+			res.register_advancement()
+			self.advance()
+
+		while self.current_tok.type != TT_EOF:
+			stmt = res.register(self.expr())
+			if res.error: return res
+			statements.append(stmt)
+
+			while self.current_tok.type in (TT_NEWLINE, TT_COMMENT):
+				res.register_advancement()
+				self.advance()
+
+		return res.success(ListNode(
+			statements, 
+			pos_start, 
+			self.current_tok.pos_end if self.current_tok else pos_start.copy()
+		))
 
 	###################################
 
@@ -534,7 +565,7 @@ class Parser:
 					self.current_tok.pos_start, self.current_tok.pos_end,
 					"Expected identifier"
 				))
-
+	
 			var_name = self.current_tok
 			res.register_advancement()
 			self.advance()
@@ -550,6 +581,22 @@ class Parser:
 			expr = res.register(self.expr())
 			if res.error: return res
 			return res.success(VarAssignNode(var_name, expr))
+		
+		else:
+			if self.current_tok.type == TT_IDENTIFIER:
+				var_name = self.current_tok
+				res.register_advancement()
+				self.advance()
+
+				if self.current_tok.type == TT_EQ:
+					res.register_advancement()
+					self.advance()
+					expr = res.register(self.expr())
+					if res.error: return res
+					return res.success(VarAssignNode(var_name, expr))
+				else:
+					self.tok_idx -= 1
+					self.current_tok = self.tokens[self.tok_idx]
 
 		node = res.register(self.bin_op(self.comp_expr, ((TT_KEYWORD, 'and'), (TT_KEYWORD, 'or'))))
 
@@ -1238,6 +1285,24 @@ class String(Value):
 			return String(self.value * other.value).set_context(self.context), None
 		else:
 			return None, Value.illegal_operation(self, other)
+		
+	def get_comparison_gt(self, other):
+		if isinstance(other, String):
+			return Number(int(self.value > other.value)).set_context(self.context), None
+		else:
+			return None, Value.illegal_operation(self, other)
+		
+	def get_comparison_lte(self, other):
+		if isinstance(other, String):
+			return Number(int(self.value <= other.value)).set_context(self.context), None
+		else:
+			return None, Value.illegal_operation(self, other)
+		
+	def get_comparison_gte(self, other):
+		if isinstance(other, String):
+			return Number(int(self.value >= other.value)).set_context(self.context), None
+		else:
+			return None, Value.illegal_operation(self, other)
 
 	def is_true(self):
 		return len(self.value) > 0
@@ -1365,12 +1430,12 @@ class Function(BaseFunction):
 	def execute(self, args):
 		res = RTResult()
 		interpreter = Interpreter()
-		exce_ctx = self.generate_new_context()
+		exec_ctx = self.generate_new_context()
 
-		res.register(self.check_and_populate_args(args, self.arg_names, exce_ctx))
+		res.register(self.check_and_populate_args(self.arg_names, args, exec_ctx))
 		if res.error: return res
 
-		value = res.register(interpreter.visit(self.body_node, exce_ctx))
+		value = res.register(interpreter.visit(self.body_node, exec_ctx))
 		if res.error: return res
 		return res.success(value)
 
@@ -1382,6 +1447,15 @@ class Function(BaseFunction):
 
 	def __repr__(self):
 		return f"<function {self.name}>"
+	
+class GraphicsContext:
+	def __init__(self):
+		self.window = None
+		self.canvas = None
+		self.objects = {}
+		self.next_id = 1
+
+graphics_context = GraphicsContext()
 	
 class BuiltInFunction(BaseFunction):
 	def __init__(self, name):
@@ -1480,6 +1554,441 @@ class BuiltInFunction(BaseFunction):
 		return RTResult().success(Number.null)
 	execute_append.arg_names = ['list', 'value']
 
+	def execute_initWindow(self, exce_ctx):
+		name = exce_ctx.symbol_table.get('name')
+		width = exce_ctx.symbol_table.get('width')
+		height = exce_ctx.symbol_table.get('height')
+
+		if not isinstance(name, String):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"First argument (name) must be a string",
+				exce_ctx
+			))
+		
+		if not isinstance(width, Number):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Second argument (width must be a number)",
+				exce_ctx
+			))
+		
+		if not isinstance(height, Number):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Third argument (height) must be a number",
+				exce_ctx
+			))
+		
+		window_name = name.value
+		window_width = int(width.value)
+		window_height = int(height.value)
+
+		try:
+			if graphics_context.window and graphics_context.window.winfo_exists():
+				graphics_context.window.destroy()
+
+			window = tk.Tk()
+			window.title(window_name)
+			window.geometry(f"{window_width}x{window_height}")
+
+			canvas = tk.Canvas(window, width=window_width, height=window_height)
+			canvas.pack()
+
+			#close handling
+			def on_closing():
+				if graphics_context.window == window:
+					graphics_context.window = None
+					graphics_context.canvas = None
+				window.destroy()
+			window.protocol("WM_DELETE_WINDOW", on_closing)
+
+			#global context
+			graphics_context.window = window
+			graphics_context.canvas = canvas
+			graphics_context.objects = []
+
+			#show the window (non blocking)
+			window.update()
+			window.deiconify()
+
+			return RTResult().success(String(f"Window '{window_name}' created"))
+		
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to create window: {str(e)}",
+				exce_ctx
+			))
+		
+	execute_initWindow.arg_names = ['name', 'width', 'height']
+
+	def execute_createRectangle(self, exec_ctx):
+		#check for active window
+		if not graphics_context.canvas:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		#get arguments
+		x = exec_ctx.symbol_table.get('x')
+		y = exec_ctx.symbol_table.get('y')
+		width = exec_ctx.symbol_table.get('width')
+		height = exec_ctx.symbol_table.get('height')
+		color = exec_ctx.symbol_table.get('color')
+
+		#validate arguments
+		if not all(isinstance(arg, Number) for arg in [x, y, width, height]):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Arguments x, y, width and height must be numbers",
+				exec_ctx
+			))
+		
+		if not isinstance(color, String):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Argument color must be a string",
+				exec_ctx
+			))
+		
+		try:
+			obj_id = graphics_context.canvas.create_rectangle(
+				x.value, y.value, 
+				x.value + width.value, 
+				y.value + height.value,
+				fill=color.value,
+				outline=color.value
+			)
+			graphics_context.objects[graphics_context.next_id] = obj_id
+			graphics_context.next_id += 1
+			return RTResult().success(Number(graphics_context.next_id - 1))
+		
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to create rectangle: {str(e)}",
+				exec_ctx
+			))
+	execute_createRectangle.arg_names = ['x', 'y', 'width', 'height', 'color']
+
+	def execute_createCircle(self, exec_ctx):
+		#check for active window
+		if not graphics_context.canvas:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		#get arguments
+		x = exec_ctx.symbol_table.get('x')
+		y = exec_ctx.symbol_table.get('y')
+		radius = exec_ctx.symbol_table.get('radius')
+		color = exec_ctx.symbol_table.get('color')
+
+		#validate arguments
+		if not all(isinstance(arg, Number) for arg in [x, y, radius]):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Arguments x, y and radius must be numbers",
+				exec_ctx
+			))
+		
+		if not isinstance(color, String):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Argument color must be a string",
+				exec_ctx
+			))
+		
+		try:
+			obj_id = graphics_context.canvas.create_oval(
+				x.value - radius.value, y.value - radius.value,
+				x.value + radius.value, y.value + radius.value,
+				fill=color.value,
+				outline=color.value
+			)
+			graphics_context.objects[graphics_context.next_id] = obj_id
+			graphics_context.next_id += 1
+			return RTResult().success(Number(graphics_context.next_id - 1))
+		
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to create circle: {str(e)}",
+				exec_ctx
+			))
+	execute_createCircle.arg_names = ['x', 'y', 'radius', 'color']
+
+	def execute_createLine(self, exec_ctx):
+		#check for active window
+		if not graphics_context.canvas:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		#get arguments
+		x1 = exec_ctx.symbol_table.get('x1')
+		y1 = exec_ctx.symbol_table.get('y1')
+		x2 = exec_ctx.symbol_table.get('x2')
+		y2 = exec_ctx.symbol_table.get('y2')
+		color = exec_ctx.symbol_table.get('color')
+
+		#validate arguments
+		if not all(isinstance(arg, Number) for arg in [x1, y1, x2, y2]):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Arguments x1, y1, x2 and y2 must be numbers",
+				exec_ctx
+			))
+		
+		if not isinstance(color, String):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Argument color must be a string",
+				exec_ctx
+			))
+		
+		try:
+			obj_id = graphics_context.canvas.create_line(
+				x1.value, y1.value, 
+				x2.value, y2.value,
+				fill=color.value,
+				width=2
+			)
+			graphics_context.objects[graphics_context.next_id] = obj_id
+			graphics_context.next_id += 1
+			return RTResult().success(Number(graphics_context.next_id - 1))
+		
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to create line: {str(e)}",
+				exec_ctx
+			))
+	execute_createLine.arg_names = ['x1', 'y1', 'x2', 'y2', 'color']
+
+	def execute_text(self, exec_ctx):
+		#check for active window
+		if not graphics_context.canvas:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		#get arguments
+		x = exec_ctx.symbol_table.get('x')
+		y = exec_ctx.symbol_table.get('y')
+		text = exec_ctx.symbol_table.get('text')
+		color = exec_ctx.symbol_table.get('color')
+
+		#validate arguments
+		if not all(isinstance(arg, Number) for arg in [x, y]):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Arguments x and y must be numbers",
+				exec_ctx
+			))
+		
+		if not isinstance(text, String):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Argument text must be a string",
+				exec_ctx
+			))
+		
+		if not isinstance(color, String):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Argument color must be a string",
+				exec_ctx
+			))
+		
+		try:
+			obj_id = graphics_context.canvas.create_text(
+				x.value, y.value,
+				text=text.value,
+				fill=color.value,
+				font=('Arial', 12)
+			)
+			graphics_context.objects[graphics_context.next_id] = obj_id
+			graphics_context.next_id += 1
+			return RTResult().success(Number(graphics_context.next_id - 1))
+		
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to create text: {str(e)}",
+				exec_ctx
+			))
+	execute_text.arg_names = ['x', 'y', 'text', 'color']
+
+	def execute_moveObject(self, exec_ctx):
+		#check for active window
+		if not graphics_context.canvas:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		#get arguments
+		obj_id = exec_ctx.symbol_table.get('id')
+		x = exec_ctx.symbol_table.get('x')
+		y = exec_ctx.symbol_table.get('y')
+
+		#validate arguments
+		if not isinstance(obj_id, Number):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Argument id must be a number",
+				exec_ctx
+			))
+		
+		if not all(isinstance(arg, Number) for arg in [x, y]):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Arguments x and y must be numbers",
+				exec_ctx
+			))
+		
+		try:
+			if obj_id.value not in graphics_context.objects:
+				return RTResult().failure(RTError(
+					self.pos_start, self.pos_end,
+					f"Object with id {obj_id.value} does not exist",
+					exec_ctx
+				))
+
+			obj_canvas_id = graphics_context.objects[obj_id.value]
+			graphics_context.canvas.move(obj_canvas_id, x.value, y.value)
+			return RTResult().success(Number.null)
+		
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to move object: {str(e)}",
+				exec_ctx
+			))
+	execute_moveObject.arg_names = ['id', 'x', 'y']
+
+	def execute_removeObject(self, exec_ctx):
+		#check for active window
+		if not graphics_context.canvas:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		obj_id = exec_ctx.symbol_table.get('id')
+
+		if not isinstance(obj_id, Number):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Argument id must be a number",
+				exec_ctx
+			))
+		
+		try:
+			if obj_id.value in graphics_context.objects:
+				graphics_context.canvas.delete(graphics_context.objects[obj_id.value])
+				del graphics_context.objects[obj_id.value]
+				return RTResult().success(Number.null)
+			else:
+				return RTResult().failure(RTError(
+					self.pos_start, self.pos_end,
+					f"Object with id {obj_id.value} does not exist",
+					exec_ctx
+				))
+		
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to remove object: {str(e)}",
+				exec_ctx
+			))
+	execute_removeObject.arg_names = ['id']
+
+	def execute_update(self, exec_ctx):
+		#check for active window
+		if not graphics_context.window:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		try:
+			graphics_context.window.update()
+			return RTResult().success(Number.null)
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to update window: {str(e)}",
+				exec_ctx
+			))
+	execute_update.arg_names = []
+
+	def execute_clearCanvas(self, exec_ctx):
+		#check for active window
+		if not graphics_context.canvas:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		try:
+			graphics_context.canvas.delete("all")
+			graphics_context.objects.clear()
+			graphics_context.next_id = 1
+			return RTResult().success(Number.null)
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to clear canvas: {str(e)}",
+				exec_ctx
+			))
+	execute_clearCanvas.arg_names = []
+
+	def execute_mainLoop(self, exec_ctx):
+		if not graphics_context.window:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"No active window found",
+				exec_ctx
+			))
+		
+		try:
+			graphics_context.window.mainLoop()
+			return RTResult().success(Number.null)
+		except Exception as e:
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				f"Failed to start main loop: {str(e)}",
+				exec_ctx
+			))
+	execute_mainLoop.arg_names = []
+
+	def execute_wait(self, exec_ctx):
+		seconds = exec_ctx.symbol_table.get('seconds')
+		if not isinstance(seconds, Number):
+			return RTResult().failure(RTError(
+				self.pos_start, self.pos_end,
+				"Argument seconds must be a number",
+				exec_ctx
+			))
+		time.sleep(seconds.value)
+		return RTResult().success(Number.null)
+	execute_wait.arg_names = ['seconds']
+
 	def execute_pop(self, exec_ctx):
 		list_ = exec_ctx.symbol_table.get('list')
 		index = exec_ctx.symbol_table.get('index')
@@ -1527,9 +2036,11 @@ class BuiltInFunction(BaseFunction):
 				exec_ctx
 			))
 		
-		listA.elements.extend(list.elements)
+		listA.elements.extend(listB.elements)
 		return RTResult().success(Number.null)
 	execute_extend.arg_names = ["listA", "listB"]
+
+
 
 BuiltInFunction.print		=BuiltInFunction("print")
 BuiltInFunction.print_ret	=BuiltInFunction("print_ret")
@@ -1543,6 +2054,17 @@ BuiltInFunction.is_function	=BuiltInFunction("is_function")
 BuiltInFunction.append		=BuiltInFunction("append")
 BuiltInFunction.pop			=BuiltInFunction("pop")
 BuiltInFunction.extend		=BuiltInFunction("extend")
+BuiltInFunction.initWindow = BuiltInFunction("initWindow")
+BuiltInFunction.createRectangle = BuiltInFunction("createRectangle")
+BuiltInFunction.createCircle = BuiltInFunction("createCircle")
+BuiltInFunction.createLine = BuiltInFunction("createLine")
+BuiltInFunction.text = BuiltInFunction("text")
+BuiltInFunction.moveObject = BuiltInFunction("moveObject")
+BuiltInFunction.removeObject = BuiltInFunction("removeObject")
+BuiltInFunction.update = BuiltInFunction("update")
+BuiltInFunction.clearCanvas = BuiltInFunction("clearCanvas")
+BuiltInFunction.mainLoop = BuiltInFunction("mainLoop")
+BuiltInFunction.wait = BuiltInFunction("wait")
 
 #######################################
 # CONTEXT
@@ -1707,12 +2229,22 @@ class Interpreter:
 				if res.error: return res
 				return res.success(expr_value)
 
+		print(f"DEBUG: condition_value = {node.condition_value}")
+		print(f"DEBUG: condition_value type = {type(node.condition_value)}")
+		if node.condition_value is not None:
+			print(f"DEBUG: condition_value.is_true() = {node.condition_value.is_true()}")
+
+		if node.condition_value and node.condition_value.is_true():
+			expr_value = res.register(self.visit(node.expr_node, context))
+			if res.error: return res
+			return res.success(expr_value)
+
 		if node.else_case:
 			else_value = res.register(self.visit(node.else_case, context))
 			if res.error: return res
 			return res.success(else_value)
 
-		return res.success(None)
+		return res.success(Number.null)
 
 	def visit_ForNode(self, node, context):
 		res = RTResult()
@@ -1817,6 +2349,17 @@ global_symbol_table.set("isFunc", BuiltInFunction.is_function)
 global_symbol_table.set("append", BuiltInFunction.append)
 global_symbol_table.set("pop", BuiltInFunction.pop)
 global_symbol_table.set("extend", BuiltInFunction.extend)
+global_symbol_table.set("initWindow", BuiltInFunction.initWindow)
+global_symbol_table.set("createRectangle", BuiltInFunction.createRectangle)
+global_symbol_table.set("createCircle", BuiltInFunction.createCircle)
+global_symbol_table.set("createLine", BuiltInFunction.createLine)
+global_symbol_table.set("text", BuiltInFunction.text)
+global_symbol_table.set("removeObject", BuiltInFunction.removeObject)
+global_symbol_table.set("moveObject", BuiltInFunction.moveObject)
+global_symbol_table.set("update", BuiltInFunction.update)
+global_symbol_table.set("clearCanvas", BuiltInFunction.clearCanvas)
+global_symbol_table.set("mainLoop", BuiltInFunction("mainLoop"))
+global_symbol_table.set("wait", BuiltInFunction("wait"))
 
 def run(fn, text):
 	# Generate tokens

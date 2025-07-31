@@ -1,0 +1,24 @@
+say("Hello, World!")
+say("This is a calculator...")
+
+say("Please enter the first number:")
+var num1 = takeInpInt()
+say("num1 is:")
+say(num1)
+
+say("Please enter the second number:")
+var num2 = takeInpInt()
+say("num2 is:")
+say(num2)
+
+say("Please enter the operator:")
+var operator = takeInp()
+say("operator is:")
+say(operator)
+
+say("About to calculate...")
+if operator == "+" then say(num1 + num2)
+elif operator == "-" then say(num1 - num2)
+elif operator == "*" then say(num1 * num2)
+elif operator == "/" then say(num1 / num2)
+else say("Invalid operator!")
